@@ -46,7 +46,7 @@ const PARASAIL_KEYWORDS: { [key: string]: string } = {
   "type": "Defines a type: `type Name is ...`",
   "interface": "Declares a parameterized interface: `interface Name<> is ... end interface Name`",
   "class": "Defines a class: `class Name is ... end class Name`",
-  "operator": "Operator overload: `operator \"=\"(Left: Type, Right: Type) -> Boolean is ...`",
+  "op": "Operator overload: `operator \"=\"(Left: Type, Right: Type) -> Boolean is ...`",
   "const": "Constant declaration: `const Name: Type := Value`",
   "var": "Variable declaration: `var Name: Type := Value`",
   "abstract": "Abstract operation in interfaces: `abstract func Name(...)`",
