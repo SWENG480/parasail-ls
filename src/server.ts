@@ -6,6 +6,14 @@
  * code actions, renaming, formatting, and semantic tokens.
  *
  * Logging is enabled (via connection.console.log) to show actions (token consumption, parsing, etc.).
+ *
+ * NOTE: The DSL already handles parsing, keywords, and type detectors. To obtain semantic errors,
+ *       we invoke the parasail executable with the following command:
+ *
+ *         <parasail_executable> <stdLib> <dslScript> <targetFile> -command PSL_Extension_Main <targetFile>
+ *
+ *       The standard library file (e.g. aaa.psi) is loaded first so that errors are computed with the
+ *       proper context. The local parser code is retained only for completions and fallback.
  ********************************************************************************************/
 
 import {
@@ -30,13 +38,11 @@ import {
   IPCMessageReader,
   IPCMessageWriter,
   DocumentFormattingParams,
-  NotificationType,
   CodeActionParams,
   CodeAction,
   CodeActionKind,
   WorkspaceEdit,
   RenameParams,
-  Location,
   SemanticTokensParams,
   SemanticTokens,
   SemanticTokensLegend,
@@ -44,15 +50,16 @@ import {
 } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import * as path from 'path';
-import * as os from 'os';
 import * as fs from 'fs';
-
-/* --------------------------------------------------------------------------------------------
- * 1) Connection & Document Setup
- * ------------------------------------------------------------------------------------------ */
+import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
+import * as readline from 'readline';
 
 const connection = createConnection(new IPCMessageReader(process), new IPCMessageWriter(process));
 const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
+
+// Maps to store spawned DSL processes.
+const dslProcesses: Map<string, ChildProcessWithoutNullStreams> = new Map();
+const interactiveDslProcesses: Map<string, ChildProcessWithoutNullStreams> = new Map();
 
 interface ParasailSettings {
   maxNumberOfProblems: number;
@@ -71,14 +78,12 @@ let globalSettings: ParasailSettings = {
 const userDictionary: Set<string> = new Set<string>();
 const documentSettings: Map<string, Thenable<ParasailSettings>> = new Map();
 
-const tokenTypes = ["keyword", "function", "variable", "class", "interface", "operator", "number", "string"];
-const tokenModifiers: string[] = [];
-const legend: SemanticTokensLegend = { tokenTypes, tokenModifiers };
-
-/* --------------------------------------------------------------------------------------------
- * 2) Keywords, Reserved Words, Standard Library & Templates
- * ------------------------------------------------------------------------------------------ */
-
+/* -----------------------------------------------------------------------------
+ * Standard constants for fallback tokenization and completions.
+ * (These are now superseded by the DSL’s own keyword and type detection,
+ * but remain available for fallback.)
+ * -----------------------------------------------------------------------------
+ */
 const PARASAIL_KEYWORDS: { [key: string]: string } = {
   "func": "Defines a function: `func name(params) -> return_type is ... end func name`",
   "type": "Defines a type: `type Name is ... end type Name`",
@@ -127,7 +132,7 @@ const RESERVED_WORDS: string[] = [
   "of", "op", "optional", "or", "private", "queued", "ref", "rem", "return", "reverse",
   "separate", "some", "then", "type", "until", "var", "while", "with", "xor"
 ];
-RESERVED_WORDS.forEach(word => {
+RESERVED_WORDS.forEach((word: string) => {
   if (!PARASAIL_KEYWORDS[word]) {
     PARASAIL_KEYWORDS[word] = `Reserved word: \`${word}\``;
   }
@@ -177,10 +182,10 @@ const CODE_TEMPLATES = [
   }
 ];
 
-/* --------------------------------------------------------------------------------------------
- * 3) Tokenizer
- * ------------------------------------------------------------------------------------------ */
-
+/* -----------------------------------------------------------------------------
+ * Tokenizer (Retained for fallback/completions)
+ * -----------------------------------------------------------------------------
+ */
 interface Token {
   type: string;
   value: string;
@@ -198,7 +203,9 @@ function tokenizeParasail(text: string): Token[] {
     { type: 'char', regex: /^'([^'\\]|\\.)'/ },
     { type: 'number', regex: /^\d+(\.\d+)?/ },
     { type: 'identifier', regex: /^[A-Za-z_][A-Za-z0-9_]*/ },
-    { type: 'operator', regex: new RegExp(
+    {
+      type: 'operator',
+      regex: new RegExp(
         '^(::|==|!=|<=|>=|=>|<<|>>|:=|<==|<=>|' +
         '\\+=|-=|\\*=|\\/=|\\*\\*=|' +
         'and then|or else|==>|' +
@@ -217,12 +224,7 @@ function tokenizeParasail(text: string): Token[] {
         const result = pattern.regex.exec(lineText.substring(pos));
         if (result && result.index === 0) {
           if (pattern.type !== 'whitespace' && pattern.type !== 'comment') {
-            tokens.push({
-              type: pattern.type,
-              value: result[0],
-              line: lineNum,
-              character: pos
-            });
+            tokens.push({ type: pattern.type, value: result[0], line: lineNum, character: pos });
           }
           pos += result[0].length;
           matched = true;
@@ -230,12 +232,7 @@ function tokenizeParasail(text: string): Token[] {
         }
       }
       if (!matched) {
-        tokens.push({
-          type: 'unknown',
-          value: lineText[pos],
-          line: lineNum,
-          character: pos
-        });
+        tokens.push({ type: 'unknown', value: lineText[pos], line: lineNum, character: pos });
         pos++;
       }
     }
@@ -244,10 +241,10 @@ function tokenizeParasail(text: string): Token[] {
   return tokens;
 }
 
-/* --------------------------------------------------------------------------------------------
- * 4) Parser (Recursive‑Descent)
- * ------------------------------------------------------------------------------------------ */
-
+/* -----------------------------------------------------------------------------
+ * Dummy Parser (Retained for fallback/completions)
+ * -----------------------------------------------------------------------------
+ */
 interface ASTNode {
   type: string;
   name?: string;
@@ -268,666 +265,8 @@ class Parser {
     connection.console.log("Parser initialized.");
   }
 
-  current(): Token | null {
-    return this.pos < this.tokens.length ? this.tokens[this.pos] : null;
-  }
-
-  peekNextValue(): string | null {
-    return (this.pos + 1 < this.tokens.length) ? this.tokens[this.pos + 1].value : null;
-  }
-
-  consume(): Token | null {
-    const token = this.current();
-    if (token) {
-      this.pos++;
-      connection.console.log(`Consumed token: "${token.value}" at line ${token.line}, char ${token.character}`);
-    }
-    return token;
-  }
-
-  matchValue(expected: string): boolean {
-    const token = this.current();
-    if (token && token.value === expected) {
-      this.consume();
-      return true;
-    }
-    return false;
-  }
-
-  expectValue(expected: string): Token | null {
-    const token = this.current();
-    if (token && token.value === expected) {
-      return this.consume();
-    } else {
-      this.error(`Expected "${expected}"`, token);
-      return null;
-    }
-  }
-
-  error(message: string, token: Token | null) {
-    const diag: Diagnostic = {
-      severity: DiagnosticSeverity.Error,
-      range: token
-        ? { start: { line: token.line, character: token.character }, end: { line: token.line, character: token.character + token.value.length } }
-        : { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
-      message,
-      source: 'parasail-parser'
-    };
-    this.errors.push(diag);
-    connection.console.log(`Parser error: ${message}`);
-  }
-
-  // Always returns a non-null position by falling back to a fallback token if needed.
-  makePos(token: Token | null, fallback: Token): Position {
-    const t = token || fallback;
-    return { line: t.line, character: t.character + t.value.length };
-  }
-
   parseProgram(): ASTNode {
-    const root: ASTNode = { type: "Program", children: [], start: { line: 0, character: 0 }, end: { line: 0, character: 0 } };
-    connection.console.log("Parsing program...");
-    while (this.current() !== null) {
-      const decl = this.parseTopLevel();
-      if (decl) {
-        root.children.push(decl);
-      } else {
-        this.consume();
-      }
-    }
-    if (this.tokens.length > 0) {
-      const last = this.tokens[this.tokens.length - 1];
-      root.end = { line: last.line, character: last.character + last.value.length };
-    }
-    connection.console.log("Program parsed.");
-    return root;
-  }
-
-  parseTopLevel(): ASTNode | null {
-    const token = this.current();
-    if (!token) return null;
-    switch (token.value) {
-      case "module":     return this.parseModule();
-      case "interface":  return this.parseInterface();
-      case "class":      return this.parseClass();
-      case "func":       return this.parseFunction();
-      case "type":       return this.parseType();
-      case "op":         return this.parseOp();
-      case "var":
-      case "const":
-        return this.parseVarConst();
-      default:
-        return this.parseStatement();
-    }
-  }
-
-  parseModule(): ASTNode | null {
-    const startToken = this.consume();
-    if (!startToken) return null;
-    const nameToken = this.current();
-    if (!nameToken || nameToken.type !== "identifier") {
-      this.error("Expected module name", nameToken);
-      return null;
-    }
-    const name = nameToken.value;
-    this.consume();
-    if (this.matchValue("is")) {
-      // Optionally parse module header contents
-    }
-    const body: ASTNode = { type: "ModuleBody", children: [], start: this.makePos(nameToken, startToken), end: this.makePos(nameToken, startToken) };
-    while (!this.checkEnd("module")) {
-      const child = this.parseTopLevel();
-      if (child) body.children.push(child);
-      else {
-        if (!this.current()) break;
-        this.consume();
-      }
-    }
-    this.expectValue("end");
-    this.expectValue("module");
-    if (this.current() && this.current()!.value === name) {
-      this.consume();
-    }
-    const endToken = this.current() || startToken;
-    const moduleNode: ASTNode = {
-      type: "ModuleDeclaration",
-      name,
-      children: [body],
-      start: this.makePos(startToken, startToken),
-      end: this.makePos(endToken, startToken)
-    };
-    connection.console.log(`Parsed module: ${name}`);
-    return moduleNode;
-  }
-
-  checkEnd(kind: string): boolean {
-    if (this.current() && this.current()!.value === "end") {
-      const nextVal = this.peekNextValue();
-      if (nextVal === kind) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  parseInterface(): ASTNode | null {
-    const startToken = this.consume();
-    if (!startToken) return null;
-    const nameToken = this.current();
-    if (!nameToken || nameToken.type !== "identifier") {
-      this.error("Expected interface name", nameToken);
-      return null;
-    }
-    const name = nameToken.value;
-    this.consume();
-    if (this.matchValue("is")) {
-      // Optionally parse interface header
-    }
-    const body: ASTNode = { type: "InterfaceBody", children: [], start: this.makePos(nameToken, startToken), end: this.makePos(nameToken, startToken) };
-    while (!this.checkEnd("interface")) {
-      const child = this.parseTopLevel();
-      if (child) body.children.push(child);
-      else {
-        if (!this.current()) break;
-        this.consume();
-      }
-    }
-    this.expectValue("end");
-    this.expectValue("interface");
-    if (this.current() && this.current()!.value === name) {
-      this.consume();
-    }
-    const endToken = this.current() || startToken;
-    const interfaceNode: ASTNode = {
-      type: "InterfaceDeclaration",
-      name,
-      children: [body],
-      start: this.makePos(startToken, startToken),
-      end: this.makePos(endToken, startToken)
-    };
-    connection.console.log(`Parsed interface: ${name}`);
-    return interfaceNode;
-  }
-
-  parseClass(): ASTNode | null {
-    const startToken = this.consume();
-    if (!startToken) return null;
-    const nameToken = this.current();
-    if (!nameToken || nameToken.type !== "identifier") {
-      this.error("Expected class name", nameToken);
-      return null;
-    }
-    const name = nameToken.value;
-    this.consume();
-    if (this.matchValue("is")) {
-      // Optional class header parsing
-    }
-    const body: ASTNode = { type: "ClassBody", children: [], start: this.makePos(nameToken, startToken), end: this.makePos(nameToken, startToken) };
-    while (!this.checkEnd("class")) {
-      const child = this.parseTopLevel();
-      if (child) body.children.push(child);
-      else {
-        if (!this.current()) break;
-        this.consume();
-      }
-    }
-    this.expectValue("end");
-    this.expectValue("class");
-    if (this.current() && this.current()!.value === name) {
-      this.consume();
-    }
-    const endToken = this.current() || startToken;
-    const classNode: ASTNode = {
-      type: "ClassDeclaration",
-      name,
-      children: [body],
-      start: this.makePos(startToken, startToken),
-      end: this.makePos(endToken, startToken)
-    };
-    connection.console.log(`Parsed class: ${name}`);
-    return classNode;
-  }
-
-  parseFunction(): ASTNode | null {
-    const startToken = this.consume();
-    if (!startToken) {
-      this.error("Expected 'func' token", null);
-      return null;
-    }
-    const nameToken = this.current();
-    if (!nameToken || nameToken.type !== "identifier") {
-      this.error("Expected function name", nameToken);
-      return null;
-    }
-    const name = nameToken.value;
-    this.consume();
-    this.expectValue("(");
-    while (this.current() && this.current()!.value !== ")") {
-      this.consume();
-    }
-    this.expectValue(")");
-    this.expectValue("->");
-    const retTypeToken = this.current();
-    if (!retTypeToken || retTypeToken.type !== "identifier") {
-      this.error("Expected return type", retTypeToken);
-      return null;
-    }
-    this.consume();
-    this.expectValue("is");
-    const bodyStart = this.current() ? { line: this.current()!.line, character: this.current()!.character } : { line: 0, character: 0 };
-    const body: ASTNode = { type: "FunctionBody", children: [], start: bodyStart, end: { line: 0, character: 0 } };
-    while (this.current() && !(this.current()!.value === "end" && this.peekNextValue() === "func")) {
-      const child = this.parseStatementOrDecl();
-      if (child) body.children.push(child);
-      else this.consume();
-    }
-    this.expectValue("end");
-    this.expectValue("func");
-    const endToken = this.current() || startToken;
-    const funcNode: ASTNode = {
-      type: "FunctionDeclaration",
-      name,
-      children: [body],
-      start: this.makePos(startToken, startToken),
-      end: this.makePos(endToken, startToken)
-    };
-    connection.console.log(`Parsed function: ${name}`);
-    return funcNode;
-  }
-
-  parseType(): ASTNode | null {
-    const startToken = this.consume();
-    if (!startToken) {
-      this.error("Expected 'type' token", null);
-      return null;
-    }
-    const nameToken = this.current();
-    if (!nameToken || nameToken.type !== "identifier") {
-      this.error("Expected type name", nameToken);
-      return null;
-    }
-    const name = nameToken.value;
-    this.consume();
-    this.expectValue("is");
-    const body: ASTNode = { type: "TypeBody", children: [], start: this.makePos(nameToken, startToken), end: this.makePos(nameToken, startToken) };
-    while (!this.checkEnd("type")) {
-      if (!this.current()) break;
-      const child = this.parseStatementOrDecl();
-      if (child) body.children.push(child);
-      else this.consume();
-    }
-    this.expectValue("end");
-    this.expectValue("type");
-    if (this.current() && this.current()!.value === name) {
-      this.consume();
-    }
-    const endToken = this.current() || startToken;
-    const typeNode: ASTNode = {
-      type: "TypeDeclaration",
-      name,
-      children: [body],
-      start: this.makePos(startToken, startToken),
-      end: this.makePos(endToken, startToken)
-    };
-    connection.console.log(`Parsed type: ${name}`);
-    return typeNode;
-  }
-
-  parseOp(): ASTNode | null {
-    const startToken = this.consume();
-    if (!startToken) {
-      this.error("Expected 'op' token", null);
-      return null;
-    }
-    const opSymbolToken = this.current();
-    if (!opSymbolToken || opSymbolToken.type !== "string") {
-      this.error("Expected operator string literal after 'op'", opSymbolToken);
-      return null;
-    }
-    const opName = opSymbolToken.value;
-    this.consume();
-    this.expectValue("(");
-    while (this.current() && this.current()!.value !== ")") {
-      this.consume();
-    }
-    this.expectValue(")");
-    if (this.matchValue("->")) {
-      const retType = this.current();
-      if (retType && retType.type === "identifier") {
-        this.consume();
-      } else {
-        this.error("Expected return type after ->", retType);
-      }
-    }
-    this.expectValue("is");
-    const body: ASTNode = { type: "OperatorBody", children: [], start: this.makePos(opSymbolToken, startToken), end: this.makePos(opSymbolToken, startToken) };
-    while (this.current() && !(this.current()!.value === "end" && this.peekNextValue() === "op")) {
-      const child = this.parseStatementOrDecl();
-      if (child) body.children.push(child);
-      else this.consume();
-    }
-    this.expectValue("end");
-    this.expectValue("op");
-    if (this.current() && this.current()!.value === opSymbolToken.value) {
-      this.consume();
-    }
-    const endToken = this.current() || startToken;
-    const opNode: ASTNode = {
-      type: "OperatorDeclaration",
-      name: opName,
-      children: [body],
-      start: this.makePos(startToken, startToken),
-      end: this.makePos(endToken, startToken)
-    };
-    connection.console.log(`Parsed operator: ${opName}`);
-    return opNode;
-  }
-
-  parseVarConst(): ASTNode | null {
-    const startToken = this.consume();
-    if (!startToken) {
-      this.error("Expected 'var' or 'const' token", null);
-      return null;
-    }
-    const varType = startToken.value;
-    const nameToken = this.current();
-    if (!nameToken || nameToken.type !== "identifier") {
-      this.error("Expected variable/const name", nameToken);
-      return null;
-    }
-    const name = nameToken.value;
-    this.consume();
-    if (this.matchValue(":")) {
-      if (this.current() && this.current()!.type === "identifier") {
-        this.consume();
-      }
-    }
-    if (this.current() && (this.current()!.value === ":=" || this.current()!.value === "<==")) {
-      this.consume();
-      while (this.current() && this.current()!.value !== ";") {
-        this.consume();
-      }
-    }
-    this.expectValue(";");
-    const endToken = this.current() || startToken;
-    const varNode: ASTNode = {
-      type: varType === "var" ? "VariableDeclaration" : "ConstantDeclaration",
-      name,
-      children: [],
-      start: this.makePos(startToken, startToken),
-      end: this.makePos(endToken, startToken)
-    };
-    connection.console.log(`Parsed ${varType} declaration: ${name}`);
-    return varNode;
-  }
-
-  parseStatementOrDecl(): ASTNode | null {
-    const token = this.current();
-    if (!token) return null;
-    switch (token.value) {
-      case "var":
-      case "const":
-        return this.parseVarConst();
-      case "func":
-        return this.parseFunction();
-      case "type":
-        return this.parseType();
-      case "op":
-        return this.parseOp();
-      case "if":
-      case "case":
-      case "loop":
-      case "while":
-      case "for":
-      case "block":
-      case "exit":
-      case "continue":
-        return this.parseStatement();
-      default:
-        return this.parseStatement();
-    }
-  }
-
-  parseStatement(): ASTNode | null {
-    const token = this.current();
-    if (!token) return null;
-    switch (token.value) {
-      case "if":     return this.parseIfStatement();
-      case "case":   return this.parseCaseStatement();
-      case "loop":   return this.parseLoopStatement();
-      case "block":  return this.parseBlockStatement();
-      case "while":  return this.parseWhileStatement();
-      case "for":    return this.parseForStatement();
-      case "exit":   return this.parseExitStatement();
-      case "continue": return this.parseContinueStatement();
-      default:
-        return this.parseExprStatement();
-    }
-  }
-
-  parseIfStatement(): ASTNode | null {
-    const startToken = this.consume();
-    if (!startToken) return null;
-    while (this.current() && this.current()!.value !== "then") {
-      this.consume();
-    }
-    this.expectValue("then");
-    const ifBody: ASTNode = { type: "IfBody", children: [], start: this.makePos(startToken, startToken), end: this.makePos(startToken, startToken) };
-    while (this.current() && !this.checkAny(["elsif", "else", "end"])) {
-      const child = this.parseStatementOrDecl();
-      if (child) ifBody.children.push(child);
-      else this.consume();
-    }
-    const elsifNodes: ASTNode[] = [];
-    while (this.current() && this.current()!.value === "elsif") {
-      const elsifToken = this.consume()!; // non-null
-      while (this.current() && this.current()!.value !== "then") {
-        this.consume();
-      }
-      this.expectValue("then");
-      const elsifBody: ASTNode = { type: "ElsifBody", children: [], start: this.makePos(elsifToken, startToken), end: this.makePos(elsifToken, startToken) };
-      while (this.current() && !this.checkAny(["elsif", "else", "end"])) {
-        const child = this.parseStatementOrDecl();
-        if (child) elsifBody.children.push(child);
-        else this.consume();
-      }
-      elsifNodes.push(elsifBody);
-    }
-    let elseNode: ASTNode | null = null;
-    if (this.current() && this.current()!.value === "else") {
-      const elseToken = this.consume()!;
-      const elseBody: ASTNode = { type: "ElseBody", children: [], start: this.makePos(elseToken, startToken), end: this.makePos(elseToken, startToken) };
-      while (this.current() && !this.checkEnd("if")) {
-        const child = this.parseStatementOrDecl();
-        if (child) elseBody.children.push(child);
-        else this.consume();
-      }
-      elseNode = elseBody;
-    }
-    this.expectValue("end");
-    this.expectValue("if");
-    const endToken = this.current() || startToken;
-    const ifNode: ASTNode = {
-      type: "IfStatement",
-      name: "if",
-      children: [ifBody, ...elsifNodes],
-      start: this.makePos(startToken, startToken),
-      end: this.makePos(endToken, startToken)
-    };
-    if (elseNode) ifNode.children.push(elseNode);
-    return ifNode;
-  }
-
-  parseCaseStatement(): ASTNode | null {
-    const startToken = this.consume();
-    if (!startToken) return null;
-    while (this.current() && this.current()!.value !== "of") {
-      this.consume();
-    }
-    this.expectValue("of");
-    const caseBody: ASTNode = { type: "CaseBody", children: [], start: this.makePos(startToken, startToken), end: this.makePos(startToken, startToken) };
-    while (!this.checkEnd("case")) {
-      if (!this.current()) break;
-      this.consume();
-    }
-    this.expectValue("end");
-    this.expectValue("case");
-    const endToken = this.current() || startToken;
-    const caseNode: ASTNode = {
-      type: "CaseStatement",
-      name: "case",
-      children: [caseBody],
-      start: this.makePos(startToken, startToken),
-      end: this.makePos(endToken, startToken)
-    };
-    return caseNode;
-  }
-
-  parseLoopStatement(): ASTNode | null {
-    const startToken = this.consume();
-    if (!startToken) return null;
-    const loopBody: ASTNode = { type: "LoopBody", children: [], start: this.makePos(startToken, startToken), end: this.makePos(startToken, startToken) };
-    while (!this.checkEnd("loop")) {
-      if (!this.current()) break;
-      const child = this.parseStatementOrDecl();
-      if (child) loopBody.children.push(child);
-      else this.consume();
-    }
-    this.expectValue("end");
-    this.expectValue("loop");
-    const endToken = this.current() || startToken;
-    const loopNode: ASTNode = {
-      type: "LoopStatement",
-      children: [loopBody],
-      start: this.makePos(startToken, startToken),
-      end: this.makePos(endToken, startToken)
-    };
-    return loopNode;
-  }
-
-  parseBlockStatement(): ASTNode | null {
-    const startToken = this.consume();
-    if (!startToken) return null;
-    const blockBody: ASTNode = { type: "BlockBody", children: [], start: this.makePos(startToken, startToken), end: this.makePos(startToken, startToken) };
-    while (!this.checkEnd("block")) {
-      if (!this.current()) break;
-      const child = this.parseStatementOrDecl();
-      if (child) blockBody.children.push(child);
-      else this.consume();
-    }
-    this.expectValue("end");
-    this.expectValue("block");
-    const endToken = this.current() || startToken;
-    const blockNode: ASTNode = {
-      type: "BlockStatement",
-      children: [blockBody],
-      start: this.makePos(startToken, startToken),
-      end: this.makePos(endToken, startToken)
-    };
-    return blockNode;
-  }
-
-  parseWhileStatement(): ASTNode | null {
-    const startToken = this.consume();
-    if (!startToken) return null;
-    while (this.current() && this.current()!.value !== "loop") {
-      this.consume();
-    }
-    this.expectValue("loop");
-    const whileBody: ASTNode = { type: "WhileBody", children: [], start: this.makePos(startToken, startToken), end: this.makePos(startToken, startToken) };
-    while (!this.checkEnd("loop")) {
-      if (!this.current()) break;
-      const child = this.parseStatementOrDecl();
-      if (child) whileBody.children.push(child);
-      else this.consume();
-    }
-    this.expectValue("end");
-    this.expectValue("loop");
-    const endToken = this.current() || startToken;
-    const whileNode: ASTNode = {
-      type: "WhileStatement",
-      children: [whileBody],
-      start: this.makePos(startToken, startToken),
-      end: this.makePos(endToken, startToken)
-    };
-    return whileNode;
-  }
-
-  parseForStatement(): ASTNode | null {
-    const startToken = this.consume();
-    if (!startToken) return null;
-    while (this.current() && this.current()!.value !== "loop") {
-      this.consume();
-    }
-    this.expectValue("loop");
-    const forBody: ASTNode = { type: "ForBody", children: [], start: this.makePos(startToken, startToken), end: this.makePos(startToken, startToken) };
-    while (!this.checkEnd("loop")) {
-      if (!this.current()) break;
-      const child = this.parseStatementOrDecl();
-      if (child) forBody.children.push(child);
-      else this.consume();
-    }
-    this.expectValue("end");
-    this.expectValue("loop");
-    const endToken = this.current() || startToken;
-    const forNode: ASTNode = {
-      type: "ForStatement",
-      children: [forBody],
-      start: this.makePos(startToken, startToken),
-      end: this.makePos(endToken, startToken)
-    };
-    return forNode;
-  }
-
-  parseExitStatement(): ASTNode | null {
-    const startToken = this.consume();
-    if (!startToken) return null;
-    if (this.current() && (this.current()!.value === "loop" || this.current()!.value === "if" || this.current()!.value === "block")) {
-      this.consume();
-    }
-    const exitNode: ASTNode = {
-      type: "ExitStatement",
-      children: [],
-      start: this.makePos(startToken, startToken),
-      end: this.makePos(startToken, startToken)
-    };
-    return exitNode;
-  }
-
-  parseContinueStatement(): ASTNode | null {
-    const startToken = this.consume();
-    if (!startToken) return null;
-    if (this.current() && this.current()!.value === "loop") {
-      this.consume();
-    }
-    const contNode: ASTNode = {
-      type: "ContinueStatement",
-      children: [],
-      start: this.makePos(startToken, startToken),
-      end: this.makePos(startToken, startToken)
-    };
-    return contNode;
-  }
-
-  parseExprStatement(): ASTNode | null {
-    const startToken = this.current();
-    if (!startToken) return null;
-    while (this.current() && this.current()!.value !== ";") {
-      this.consume();
-    }
-    if (this.current() && this.current()!.value === ";") {
-      this.consume();
-    }
-    const exprNode: ASTNode = {
-      type: "ExpressionStatement",
-      children: [],
-      start: this.makePos(startToken, startToken),
-      end: this.makePos(startToken, startToken)
-    };
-    return exprNode;
-  }
-
-  checkAny(values: string[]): boolean {
-    return this.current() ? values.includes(this.current()!.value) : false;
+    return { type: "Program", children: [], start: { line: 0, character: 0 }, end: { line: 0, character: 0 } };
   }
 }
 
@@ -939,10 +278,10 @@ function parseFullDocument(text: string): { ast: ASTNode | null; errors: Diagnos
   return { ast, errors: parser.errors };
 }
 
-/* --------------------------------------------------------------------------------------------
- * 5) Helper: Convert Index to Position
- * ------------------------------------------------------------------------------------------ */
-
+/* -----------------------------------------------------------------------------
+ * Helper: Convert Index to Position
+ * -----------------------------------------------------------------------------
+ */
 function positionFromIndex(text: string, idx: number): { line: number; character: number } {
   const lines = text.slice(0, idx).split('\n');
   const line = lines.length - 1;
@@ -950,12 +289,23 @@ function positionFromIndex(text: string, idx: number): { line: number; character
   return { line, character };
 }
 
-/* --------------------------------------------------------------------------------------------
- * 6) LSP Lifecycle & Configuration
- * ------------------------------------------------------------------------------------------ */
+/* -----------------------------------------------------------------------------
+ * LSP Lifecycle & Configuration
+ * -----------------------------------------------------------------------------
+ */
+let initParams: InitializeParams;
 
 connection.onInitialize((params: InitializeParams): InitializeResult => {
   connection.console.log('Initializing Parasail LSP...');
+  initParams = params;
+  if (params.initializationOptions) {
+    if (params.initializationOptions.standardLibraryPath) {
+      connection.console.log(`Standard library path: ${params.initializationOptions.standardLibraryPath}`);
+    }
+    if (params.initializationOptions.dslScript) {
+      connection.console.log(`DSL script path: ${params.initializationOptions.dslScript}`);
+    }
+  }
   return {
     capabilities: {
       textDocumentSync: TextDocumentSyncKind.Incremental,
@@ -964,23 +314,16 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
         triggerCharacters: ['.', ':', '<', '"', '/', ' ']
       },
       hoverProvider: true,
-      signatureHelpProvider: {
-        triggerCharacters: ['('],
-        retriggerCharacters: [',']
-      },
+      signatureHelpProvider: { triggerCharacters: ['('], retriggerCharacters: [','] },
       definitionProvider: true,
       documentFormattingProvider: true,
       documentSymbolProvider: true,
       referencesProvider: true,
       workspaceSymbolProvider: true,
-      codeActionProvider: {
-        resolveProvider: true
-      },
-      renameProvider: {
-        prepareProvider: true
-      },
+      codeActionProvider: { resolveProvider: true },
+      renameProvider: { prepareProvider: true },
       semanticTokensProvider: {
-        legend,
+        legend: { tokenTypes: ["keyword", "number", "string", "class"], tokenModifiers: [] },
         full: true,
         range: true
       }
@@ -994,149 +337,257 @@ connection.onDidChangeConfiguration((change: DidChangeConfigurationParams) => {
   documents.all().forEach(validateDocument);
 });
 
-documents.onDidChangeContent(change => {
-  connection.console.log(`Document changed: ${change.document.uri}`);
+// Validate only on document save.
+documents.onDidSave(change => {
+  connection.console.log(`Document saved: ${change.document.uri}`);
   validateDocument(change.document);
 });
+
 documents.onDidClose(e => {
   connection.console.log(`Document closed: ${e.document.uri}`);
   documentSettings.delete(e.document.uri);
+  const docUri = e.document.uri;
+  if (dslProcesses.has(docUri)) {
+    const proc = dslProcesses.get(docUri);
+    if (proc) {
+      connection.console.log(`Killing DSL process for doc: ${docUri}`);
+      proc.kill();
+    }
+    dslProcesses.delete(docUri);
+  }
+  if (interactiveDslProcesses.has(docUri)) {
+    const proc = interactiveDslProcesses.get(docUri);
+    if (proc) {
+      connection.console.log(`Killing interactive DSL process for doc: ${docUri}`);
+      proc.kill();
+    }
+    interactiveDslProcesses.delete(docUri);
+  }
 });
 
-/* --------------------------------------------------------------------------------------------
- * 7) Validation
- * ------------------------------------------------------------------------------------------ */
-
+/* -----------------------------------------------------------------------------
+ * Validation via DSL
+ * -----------------------------------------------------------------------------
+ * Spawns the parasail executable with the standard library and DSL script so that the DSL
+ * (extension_lookup.psl) handles keywords, type detection, and semantic analysis.
+ *
+ * Command format:
+ *   <parasail_executable> <stdLib> <dslScript> <targetFile> -command PSL_Extension_Main <targetFile>
+ */
 async function validateDocument(document: TextDocument): Promise<void> {
-  const text = document.getText();
-  const diagnostics: Diagnostic[] = [];
+  const docUri = document.uri;
+  const docPath = uriToFilePath(docUri);
+  if (!docPath) return;
 
-  // Naive token-based spelling check (using whitespace split)
-  const tokensText = text.split(/[\s,.:(){}[\]]+/);
-  let problemCount = 0;
-  for (const token of tokensText) {
-    const word = token.trim();
-    if (!word) continue;
-    const isKeyword = !!PARASAIL_KEYWORDS[word.toLowerCase()];
-    const isStdLib = Object.keys(STANDARD_LIBRARY).some(k => k.toLowerCase().includes(word.toLowerCase()));
-    const isUserDict = userDictionary.has(word);
-    if (!isKeyword && !isStdLib && !isUserDict && isNaN(Number(word))) {
-      problemCount++;
-      if (problemCount > globalSettings.maxNumberOfProblems) break;
-      const index = text.indexOf(word);
-      if (index >= 0) {
-        const pos = positionFromIndex(text, index);
-        diagnostics.push({
-          severity: DiagnosticSeverity.Warning,
-          range: {
-            start: { line: pos.line, character: pos.character },
-            end: { line: pos.line, character: pos.character + word.length }
-          },
-          message: `Unrecognized word "${word}"`,
-          source: 'parasail',
-          code: 'SpellingError'
-        });
-      }
-    }
+  const parasailCmd = process.env.PARASAIL_CMD || "/Users/aisenlopezramos/parasail_macos_build/build/bin/parasail_main";
+  const dslScript = initParams.initializationOptions && initParams.initializationOptions.dslScript
+    ? initParams.initializationOptions.dslScript
+    : undefined;
+  const stdLib = initParams.initializationOptions && initParams.initializationOptions.standardLibraryPath
+    ? initParams.initializationOptions.standardLibraryPath
+    : undefined;
+
+  if (!dslScript) {
+    connection.console.log("No DSL script provided, skipping validation.");
+    return;
   }
 
-  // Tokenize document and report unknown tokens
-  const tokens = tokenizeParasail(text);
-  tokens.forEach(token => {
-    if (token.type === 'unknown') {
-      diagnostics.push({
-        severity: DiagnosticSeverity.Warning,
-        range: {
-          start: { line: token.line, character: token.character },
-          end: { line: token.line, character: token.character + token.value.length }
-        },
-        message: `Unrecognized token "${token.value}"`,
-        source: 'parasail',
-        code: 'UnknownToken'
-      });
-    }
-  });
-
-  // Parse document and add parser errors
-  const parseResult = parseFullDocument(text);
-  diagnostics.push(...parseResult.errors);
-
-  // Check for functions missing an "end func" marker
-  const lines = text.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const funcMatch = line.match(/^\s*func\s+(\w+)\s*\(.*?\)\s*->\s*([\w<>]+)\s*is\s*$/);
-    if (funcMatch) {
-      let foundEnd = false;
-      for (let j = i + 1; j < lines.length; j++) {
-        if (/^\s*end\s+func/.test(lines[j])) {
-          foundEnd = true;
-          break;
-        }
-      }
-      if (!foundEnd) {
-        diagnostics.push({
-          severity: DiagnosticSeverity.Error,
-          range: {
-            start: { line: i, character: 0 },
-            end: { line: i, character: line.length }
-          },
-          message: `Function "${funcMatch[1]}" is missing an "end func".`,
-          source: 'parasail',
-          code: 'MissingEndFunc'
-        });
-      }
-    }
+  let args: string[];
+  if (stdLib) {
+    args = [stdLib, dslScript, docPath, "-command", "PSL_Extension_Main", docPath];
+  } else {
+    args = [dslScript, docPath, "-command", "PSL_Extension_Main", docPath];
   }
 
-  connection.sendDiagnostics({ uri: document.uri, diagnostics });
-  connection.console.log(`Diagnostics sent for document: ${document.uri}`);
+  connection.console.log(`Spawning DSL for semantic analysis: ${parasailCmd} ${args.join(" ")}`);
+
+  try {
+    const child = spawn(parasailCmd, args, { cwd: path.dirname(docPath), env: process.env });
+    dslProcesses.set(docUri, child);
+
+    let dslOutput = "";
+    child.stdout.on('data', (chunk: Buffer) => {
+      dslOutput += chunk.toString();
+      connection.console.log(`DSL stdout: ${chunk.toString()}`);
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      connection.console.log(`DSL stderr: ${chunk.toString()}`);
+      dslOutput += chunk.toString();
+    });
+    child.on('exit', (code) => {
+      connection.console.log(`DSL process exited with code ${code}`);
+      connection.console.log("Complete DSL output:\n" + dslOutput);
+      const diagnostics: Diagnostic[] = parseDSLDiagnostics(docPath, dslOutput);
+      connection.sendDiagnostics({ uri: docUri, diagnostics });
+      connection.console.log(`DSL diagnostics sent for document: ${docUri}`);
+    });
+  } catch (err) {
+    connection.console.error(`Error spawning DSL: ${err}`);
+  }
 }
 
-/* --------------------------------------------------------------------------------------------
- * 8) Hover Provider
- * ------------------------------------------------------------------------------------------ */
+/**
+ * Parses DSL output lines in the format:
+ *   <file>:<line>:<col>: Error|Warning: <message>
+ * and returns an array of Diagnostics.
+ */
+function parseDSLDiagnostics(targetFile: string, output: string): Diagnostic[] {
+  const diagnostics: Diagnostic[] = [];
+  const regex = /^(.+):(\d+):(\d+): (Error|Warning): (.*)$/gm;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(output)) !== null) {
+    const fileFromOutput = match[1];
+    if (path.resolve(fileFromOutput) !== path.resolve(targetFile)) continue;
+    const lineNum = parseInt(match[2], 10) - 1;
+    const colNum = parseInt(match[3], 10) - 1;
+    const severity = match[4] === "Error" ? DiagnosticSeverity.Error : DiagnosticSeverity.Warning;
+    const message = match[5].trim();
+    diagnostics.push({
+      severity,
+      range: { start: { line: lineNum, character: colNum }, end: { line: lineNum, character: colNum + 1 } },
+      message,
+      source: "ParaSail DSL"
+    });
+  }
+  return diagnostics;
+}
 
-connection.onHover((params: TextDocumentPositionParams): Hover | null => {
+/* -----------------------------------------------------------------------------
+ * Interactive DSL Integration (for hover queries)
+ * -----------------------------------------------------------------------------
+ * Spawns an interactive DSL process so that hover queries can be answered.
+ */
+function spawnInteractiveDSLForDocument(docUri: string, filePath: string): ChildProcessWithoutNullStreams | null {
+  if (interactiveDslProcesses.has(docUri)) {
+    connection.console.log(`Interactive DSL already running for doc: ${docUri}`);
+    return interactiveDslProcesses.get(docUri)!;
+  }
+  const parasailCmd = process.env.PARASAIL_CMD || "/Users/aisenlopezramos/parasail_macos_build/build/bin/parasail_main";
+  const dslScript = initParams.initializationOptions && initParams.initializationOptions.dslScript
+    ? initParams.initializationOptions.dslScript
+    : undefined;
+  if (!dslScript) {
+    connection.console.log("No DSL script provided, cannot spawn interactive DSL.");
+    return null;
+  }
+  // For interactive queries, we call the DSL script with the target file only.
+  const args = [dslScript, filePath];
+  connection.console.log(`Spawning interactive DSL: ${parasailCmd} ${args.join(" ")}`);
+  try {
+    const child = spawn(parasailCmd, args, { cwd: path.dirname(filePath), env: process.env });
+    interactiveDslProcesses.set(docUri, child);
+    const rl = readline.createInterface({ input: child.stdout });
+    rl.on('line', (line: string) => {
+      connection.console.log(`Interactive DSL stdout for doc ${docUri}: ${line}`);
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      connection.console.log(`Interactive DSL stderr for doc ${docUri}: ${chunk.toString()}`);
+    });
+    child.on('exit', (code) => {
+      connection.console.log(`Interactive DSL for doc ${docUri} exited with code ${code}`);
+      interactiveDslProcesses.delete(docUri);
+    });
+    return child;
+  } catch (err) {
+    connection.console.error(`Failed to spawn interactive DSL: ${err}`);
+    return null;
+  }
+}
+
+function queryDSLPosition(docUri: string, positionStr: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const proc = interactiveDslProcesses.get(docUri);
+    if (!proc) {
+      reject(new Error("No interactive DSL process running for doc " + docUri));
+      return;
+    }
+    let stdoutLine = "";
+    const rl = readline.createInterface({ input: proc.stdout });
+    const onLine = (line: string) => {
+      stdoutLine = line;
+      rl.removeListener('line', onLine);
+      rl.close();
+      resolve(stdoutLine);
+    };
+    rl.on('line', onLine);
+    proc.stdin.write(positionStr + "\n");
+  });
+}
+
+/* -----------------------------------------------------------------------------
+ * Hover Provider
+ * -----------------------------------------------------------------------------
+ */
+connection.onHover(async (params: TextDocumentPositionParams): Promise<Hover | null> => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return null;
   const word = getWordAtPosition(doc, params.position);
   if (!word) return null;
 
+  // 1) Check built-in keyword info.
   const keywordDoc = PARASAIL_KEYWORDS[word.toLowerCase()];
   if (keywordDoc) {
     connection.console.log(`Hover: showing keyword info for ${word}`);
     return { contents: { kind: "markdown", value: keywordDoc } };
   }
 
+  // 2) Check local symbols (fallback).
   const symbols = parseDocumentSymbolsForHover(doc);
   const symbol = symbols.get(word);
-  if (!symbol) return null;
+  if (symbol) {
+    let hoverContent = `**${symbol.kind.toUpperCase()}**: \`${symbol.name}\`\n\n`;
+    if (symbol.kind === 'var' || symbol.kind === 'const') {
+      if (symbol.type) { hoverContent += `**Type:** \`${symbol.type}\`\n\n`; }
+      if (symbol.value) { hoverContent += `**Value:** \`${symbol.value}\`\n\n`; }
+    }
+    if (symbol.kind === 'func') {
+      hoverContent += `**Parameters:** \`${symbol.params}\`\n\n`;
+      if (symbol.returnType) { hoverContent += `**Returns:** \`${symbol.returnType}\`\n\n`; }
+    }
+    hoverContent += `**Definition:**\n\`\`\`parasail\n${symbol.line}\n\`\`\``;
+    connection.console.log(`Hover: showing local symbol info for ${word}`);
+    return { contents: { kind: "markdown", value: hoverContent } };
+  }
 
-  let hoverContent = `**${symbol.kind.toUpperCase()}**: \`${symbol.name}\`\n\n`;
-  if (symbol.kind === 'var' || symbol.kind === 'const') {
-    if (symbol.type) {
-      hoverContent += `**Type:** \`${symbol.type}\`\n\n`;
+  // 3) Fallback: query the interactive DSL.
+  const docUriLocal = params.textDocument.uri;
+  const filePath = uriToFilePath(docUriLocal);
+  if (!filePath) return null;
+  const interactiveProc = spawnInteractiveDSLForDocument(docUriLocal, filePath);
+  if (!interactiveProc) return null;
+  const lineOneBased = params.position.line + 1;
+  const charOneBased = params.position.character + 1;
+  const queryStr = `${path.basename(filePath)}:${lineOneBased}:${charOneBased}`;
+  connection.console.log(`Hover: querying interactive DSL for position ${queryStr}`);
+  try {
+    const dslJsonLine = await queryDSLPosition(docUriLocal, queryStr);
+    let dslObj: any;
+    try {
+      dslObj = JSON.parse(dslJsonLine);
+    } catch (parseErr) {
+      connection.console.log(`Interactive DSL returned non-JSON or parse error: ${dslJsonLine}`);
+      return null;
     }
-    if (symbol.value) {
-      hoverContent += `**Value:** \`${symbol.value}\`\n\n`;
+    if (dslObj.error) {
+      return { contents: { kind: "markdown", value: `**DSL**: ${dslObj.error}` } };
     }
+    let hoverVal = `**DSL kind**: \`${dslObj.kind}\``;
+    if (dslObj.type && dslObj.type.name) {
+      hoverVal += `\n\n**DSL type**: \`${dslObj.type.name}\``;
+      if (dslObj.type.src) { hoverVal += `\n\n**Type definition at**: \`${dslObj.type.src}\``; }
+    }
+    connection.console.log(`Hover: showing interactive DSL info for ${word}`);
+    return { contents: { kind: "markdown", value: hoverVal } };
+  } catch (err) {
+    connection.console.warn(`Interactive DSL query failed: ${err}`);
+    return null;
   }
-  if (symbol.kind === 'func') {
-    hoverContent += `**Parameters:** \`${symbol.params}\`\n\n`;
-    if (symbol.returnType) {
-      hoverContent += `**Returns:** \`${symbol.returnType}\`\n\n`;
-    }
-  }
-  hoverContent += `**Definition:**\n\`\`\`parasail\n${symbol.line}\n\`\`\``;
-  connection.console.log(`Hover: showing symbol info for ${word}`);
-  return { contents: { kind: "markdown", value: hoverContent } };
 });
 
-/* --------------------------------------------------------------------------------------------
- * 9) Document Symbols (Regex-based for Hover)
- * ------------------------------------------------------------------------------------------ */
-
+/* -----------------------------------------------------------------------------
+ * Document Symbols (Regex-based for Hover)
+ * -----------------------------------------------------------------------------
+ */
 interface ParasailSymbol {
   kind: string;
   name: string;
@@ -1154,75 +605,78 @@ function parseDocumentSymbolsForHover(doc: TextDocument): Map<string, ParasailSy
     {
       kind: 'var',
       regex: /^\s*var\s+(\w+)\s*(?::\s*([\w<>]+))?\s*(?::=\s*(.+))?;/i,
-      extractor: (match) => ({ name: match[1], type: match[2]?.trim(), value: match[3]?.trim() })
+      extractor: (m) => ({ name: m[1], type: m[2]?.trim(), value: m[3]?.trim() })
     },
     {
       kind: 'const',
       regex: /^\s*const\s+(\w+)\s*(?::\s*([\w<>]+))?\s*(?::=\s*(.+))?;/i,
-      extractor: (match) => ({ name: match[1], type: match[2]?.trim(), value: match[3]?.trim() })
+      extractor: (m) => ({ name: m[1], type: m[2]?.trim(), value: m[3]?.trim() })
     },
     {
       kind: 'func',
-      regex: /^\s*func\s+(\w+)\s*\((.*?)\)\s*->\s*([\w<>]+)\s*is/i,
-      extractor: (match) => ({ name: match[1], params: match[2].trim(), returnType: match[3].trim() })
+      regex: /^\s*func\s+(\w+)\s*\((.*?)\)\s*->\s*([\w<>]+)\s*(is)?/i,
+      extractor: (m) => ({ name: m[1], params: m[2].trim(), returnType: m[3].trim() })
     },
     {
       kind: 'type',
       regex: /^\s*type\s+(\w+)\s+is\b/i,
-      extractor: (match) => ({ name: match[1] })
+      extractor: (m) => ({ name: m[1] })
     },
     {
       kind: 'interface',
       regex: /^\s*interface\s+(\w+)/i,
-      extractor: (match) => ({ name: match[1] })
+      extractor: (m) => ({ name: m[1] })
     },
     {
       kind: 'class',
       regex: /^\s*class\s+(\w+)/i,
-      extractor: (match) => ({ name: match[1] })
+      extractor: (m) => ({ name: m[1] })
     },
     {
       kind: 'module',
       regex: /^\s*module\s+(\w+)/i,
-      extractor: (match) => ({ name: match[1] })
+      extractor: (m) => ({ name: m[1] })
     },
     {
       kind: 'op',
       regex: /^\s*op\s+"([^"]+)"\s*\((.*?)\)/i,
-      extractor: (match) => ({ name: match[1] })
+      extractor: (m) => ({ name: m[1] })
     }
   ];
+
   const map = new Map<string, ParasailSymbol>();
   lines.forEach((line) => {
     for (const p of patterns) {
       const match = line.match(p.regex);
       if (match) {
         const info = p.extractor(match);
-        map.set(info.name!, {
-          kind: p.kind,
-          name: info.name!,
-          line: line.trim(),
-          type: info.type,
-          value: info.value,
-          params: info.params,
-          returnType: info.returnType
-        });
+        if (info.name) {
+          map.set(info.name, {
+            kind: p.kind,
+            name: info.name,
+            line: line.trim(),
+            type: info.type,
+            value: info.value,
+            params: info.params,
+            returnType: info.returnType
+          });
+        }
       }
     }
   });
   return map;
 }
 
-/* --------------------------------------------------------------------------------------------
- * 10) Completion Provider & Helpers
- * ------------------------------------------------------------------------------------------ */
-
+/* -----------------------------------------------------------------------------
+ * Completion Provider & Helpers
+ * -----------------------------------------------------------------------------
+ */
 connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
   const prefix = getCurrentWordPrefix(doc, params.position);
   connection.console.log(`Completion requested with prefix: ${prefix}`);
-  const completions = [
+  const completions: CompletionItem[] = [
     ...getKeywordCompletions(prefix),
     ...getLibraryCompletions(prefix),
     ...getTemplateCompletions(doc, params.position),
@@ -1288,47 +742,45 @@ function getImportCompletions(text: string): CompletionItem[] {
   }));
 }
 
-/* --------------------------------------------------------------------------------------------
- * 11) Code Actions
- * ------------------------------------------------------------------------------------------ */
-
+/* -----------------------------------------------------------------------------
+ * Code Actions
+ * -----------------------------------------------------------------------------
+ */
 connection.onCodeAction((params: CodeActionParams): CodeAction[] => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
   connection.console.log("Code action requested.");
   const actions: CodeAction[] = [];
+
   for (const diag of params.context.diagnostics) {
     if (diag.code === 'SpellingError' || diag.code === 'UnknownToken') {
       const text = doc.getText(diag.range);
       const title = `Add "${text}" to dictionary`;
-      const fix: CodeAction = {
+      const fix = CodeAction.create(
         title,
-        kind: CodeActionKind.QuickFix,
-        diagnostics: [diag],
-        edit: { changes: {} },
-        command: {
-          title,
-          command: 'parasail.addToDictionary',
-          arguments: [text]
-        }
-      };
+        { changes: { [doc.uri]: [{ range: diag.range, newText: text }] } },
+        CodeActionKind.QuickFix
+      );
+      fix.diagnostics = [diag];
+      fix.command = { title, command: 'parasail.addToDictionary', arguments: [text] };
       actions.push(fix);
     } else if (diag.code === 'MissingEndFunc' || diag.code === 'MissingEnd') {
       const fix: CodeAction = {
         title: `Insert missing end marker`,
         kind: CodeActionKind.QuickFix,
         diagnostics: [diag],
-        edit: {
-          changes: {
-            [doc.uri]: [{
-              range: {
-                start: { line: diag.range.start.line + 1, character: 0 },
-                end: { line: diag.range.start.line + 1, character: 0 }
-              },
-              newText: "end\n"
-            }]
-          }
-        }
+        edit: { changes: { [doc.uri]: [{
+          range: { start: { line: diag.range.start.line + 1, character: 0 }, end: { line: diag.range.start.line + 1, character: 0 } },
+          newText: "end\n"
+        }] } }
+      };
+      actions.push(fix);
+    } else {
+      const fix: CodeAction = {
+        title: `Default fix`,
+        kind: CodeActionKind.QuickFix,
+        diagnostics: [diag],
+        edit: { changes: { [doc.uri]: [] } }
       };
       actions.push(fix);
     }
@@ -1344,10 +796,10 @@ connection.onRequest('parasail.addToDictionary', (word: string) => {
   connection.console.log(`Command executed: Added "${word}" to user dictionary.`);
 });
 
-/* --------------------------------------------------------------------------------------------
- * 12) Document Formatting
- * ------------------------------------------------------------------------------------------ */
-
+/* -----------------------------------------------------------------------------
+ * Document Formatting
+ * -----------------------------------------------------------------------------
+ */
 connection.onDocumentFormatting((params: DocumentFormattingParams): TextEdit[] => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc || !globalSettings.enableFormatting) return [];
@@ -1360,7 +812,7 @@ function formatDocument(content: string, options: FormattingOptions): TextEdit[]
   const edits: TextEdit[] = [];
   lines.forEach((line, index) => {
     const indentation = line.match(/^\s*/)?.[0] || '';
-    const expected = ' '.repeat(options.tabSize * Math.max(0, (indentation.length / options.tabSize) | 0));
+    const expected = ' '.repeat(options.tabSize * Math.floor(indentation.length / options.tabSize));
     if (indentation !== expected) {
       edits.push(TextEdit.replace(
         { start: { line: index, character: 0 }, end: { line: index, character: indentation.length } },
@@ -1371,10 +823,10 @@ function formatDocument(content: string, options: FormattingOptions): TextEdit[]
   return edits;
 }
 
-/* --------------------------------------------------------------------------------------------
- * 13) Document Symbols
- * ------------------------------------------------------------------------------------------ */
-
+/* -----------------------------------------------------------------------------
+ * Document Symbols
+ * -----------------------------------------------------------------------------
+ */
 connection.onDocumentSymbol((params: DocumentSymbolParams): DocumentSymbol[] => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
@@ -1393,20 +845,14 @@ function findDocumentSymbols(content: string): DocumentSymbol[] {
   };
   const lines = content.split('\n');
   lines.forEach((line, lineNum) => {
-    for (const [_, pattern] of Object.entries(symbolPatterns)) {
+    for (const pattern of Object.values(symbolPatterns)) {
       const match = line.match(pattern);
       if (match) {
         symbols.push({
           name: match[1],
           kind: SymbolKind.Function,
-          range: {
-            start: { line: lineNum, character: 0 },
-            end: { line: lineNum, character: line.length }
-          },
-          selectionRange: {
-            start: { line: lineNum, character: match.index || 0 },
-            end: { line: lineNum, character: (match.index || 0) + match[1].length }
-          }
+          range: { start: { line: lineNum, character: 0 }, end: { line: lineNum, character: line.length } },
+          selectionRange: { start: { line: lineNum, character: match.index || 0 }, end: { line: lineNum, character: (match.index || 0) + match[1].length } }
         });
       }
     }
@@ -1414,10 +860,10 @@ function findDocumentSymbols(content: string): DocumentSymbol[] {
   return symbols;
 }
 
-/* --------------------------------------------------------------------------------------------
- * 14) Definition / References / Rename
- * ------------------------------------------------------------------------------------------ */
-
+/* -----------------------------------------------------------------------------
+ * Definition / References / Rename
+ * -----------------------------------------------------------------------------
+ */
 connection.onDefinition((params) => {
   connection.console.log("Definition request received.");
   return [];
@@ -1449,20 +895,17 @@ connection.onRenameRequest((params: RenameParams): WorkspaceEdit | null => {
   let idx = text.indexOf(oldName);
   while (idx !== -1) {
     const pos = positionFromIndex(text, idx);
-    edits.push({
-      range: { start: pos, end: { line: pos.line, character: pos.character + oldName.length } },
-      newText: newName
-    });
+    edits.push({ range: { start: pos, end: { line: pos.line, character: pos.character + oldName.length } }, newText: newName });
     idx = text.indexOf(oldName, idx + oldName.length);
   }
   connection.console.log(`Rename: Replacing "${oldName}" with "${newName}"`);
   return { changes: { [doc.uri]: edits } };
 });
 
-/* --------------------------------------------------------------------------------------------
- * 15) Semantic Tokens
- * ------------------------------------------------------------------------------------------ */
-
+/* -----------------------------------------------------------------------------
+ * Semantic Tokens
+ * -----------------------------------------------------------------------------
+ */
 connection.languages.semanticTokens.on((params: SemanticTokensParams): SemanticTokens => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return { data: [] };
@@ -1471,6 +914,7 @@ connection.languages.semanticTokens.on((params: SemanticTokensParams): SemanticT
   const tokens: number[] = [];
   let prevLine = 0;
   let prevChar = 0;
+  const tokenTypes: string[] = ["keyword", "number", "string", "class"];
   const tokenPatterns: Array<{ regex: RegExp; tokenType: string }> = [
     { regex: /\b(func|type|interface|class|op|const|var|abstract|extends|exports|import|all|new|not|and|or|xor|in|case|loop|for|while|if|then|else|elsif|end|is|parallel|forward|optional|null|block|module|exit|with|continue)\b/g, tokenType: "keyword" },
     { regex: /\b\d+(\.\d+)?\b/g, tokenType: "number" },
@@ -1478,7 +922,7 @@ connection.languages.semanticTokens.on((params: SemanticTokensParams): SemanticT
     { regex: /\b[A-Z][A-Za-z0-9_]*\b/g, tokenType: "class" }
   ];
   const tokenTypeMap: { [key: string]: number } = {};
-  tokenTypes.forEach((type, index) => { tokenTypeMap[type] = index; });
+  tokenTypes.forEach((t, index) => { tokenTypeMap[t] = index; });
   for (let line = 0; line < lines.length; line++) {
     const lineText = lines[line];
     for (const { regex, tokenType } of tokenPatterns) {
@@ -1506,6 +950,7 @@ connection.languages.semanticTokens.onRange((params: SemanticTokensRangeParams):
   const tokens: number[] = [];
   let prevLine = params.range.start.line;
   let prevChar = params.range.start.character;
+  const tokenTypes: string[] = ["keyword", "number", "string", "class"];
   const tokenPatterns: Array<{ regex: RegExp; tokenType: string }> = [
     { regex: /\b(func|type|interface|class|op|const|var|abstract|extends|exports|import|all|new|not|and|or|xor|in|case|loop|for|while|if|then|else|elsif|end|is|parallel|forward|optional|null|block|module|exit|with|continue)\b/g, tokenType: "keyword" },
     { regex: /\b\d+(\.\d+)?\b/g, tokenType: "number" },
@@ -1513,7 +958,7 @@ connection.languages.semanticTokens.onRange((params: SemanticTokensRangeParams):
     { regex: /\b[A-Z][A-Za-z0-9_]*\b/g, tokenType: "class" }
   ];
   const tokenTypeMap: { [key: string]: number } = {};
-  tokenTypes.forEach((type, index) => { tokenTypeMap[type] = index; });
+  tokenTypes.forEach((t, index) => { tokenTypeMap[t] = index; });
   for (let line = params.range.start.line; line <= params.range.end.line && line < lines.length; line++) {
     const lineText = lines[line];
     for (const { regex, tokenType } of tokenPatterns) {
@@ -1535,10 +980,10 @@ connection.languages.semanticTokens.onRange((params: SemanticTokensRangeParams):
   return { data: tokens };
 });
 
-/* --------------------------------------------------------------------------------------------
- * 16) Final Helper Functions for Hover & Completion (Consolidated)
- * ------------------------------------------------------------------------------------------ */
-
+/* -----------------------------------------------------------------------------
+ * Final Helper Functions for Hover & Completion
+ * -----------------------------------------------------------------------------
+ */
 function getWordAtPosition(doc: TextDocument, pos: Position): string | undefined {
   const lineText = doc.getText({
     start: { line: pos.line, character: 0 },
@@ -1554,13 +999,21 @@ function getWordAtPosition(doc: TextDocument, pos: Position): string | undefined
 function getCurrentWordPrefix(doc: TextDocument, pos: Position): string {
   const lineText = doc.getText({ start: { line: pos.line, character: 0 }, end: pos });
   const words = lineText.split(/[^\w$]/);
-  return words[words.length - 1];
+  return words[words.length - 1] || "";
 }
 
-/* --------------------------------------------------------------------------------------------
- * 17) LSP Lifecycle: Start Listening
- * ------------------------------------------------------------------------------------------ */
+/** Convert a URI (e.g. "file:///home/user/file.psl") to a local file path. */
+function uriToFilePath(docUri: string): string | undefined {
+  if (docUri.startsWith("file://")) {
+    return docUri.replace("file://", "");
+  }
+  return undefined;
+}
 
+/* -----------------------------------------------------------------------------
+ * LSP Lifecycle: Start Listening
+ * -----------------------------------------------------------------------------
+ */
 documents.listen(connection);
 connection.listen();
 // commit
