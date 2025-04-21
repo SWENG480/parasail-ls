@@ -1,5 +1,5 @@
 // src/fallbackParser.ts
-import { connection } from './lspLifecycle';
+import { connection } from './lspLifeCycle';
 import { Diagnostic } from 'vscode-languageserver/node';
 import { tokenizeParasail, Token } from './fallbackTokenizer';
 

@@ -3,281 +3,190 @@ import PSC::Reflection::*, *;
 /// Invoke by passing in files to check
 /// Get info by sending locations into standard input
 
-// $ interp.csh extension_lookup.psl YOUR_FILE.psl -command PSL_Extension::Main YOUR_FILE.psl
+// $interp.csh ext ension_lookup.psl YOUR_FILE.psl -command PSL_Extension_Main YOUR_FILE.psl
 // YOUR_FILE.psl:10:11
-// {
-//   "kind": "#...",
-//   "type": {
-//     "name": "Your::Type",
-//     "src": "YOUR_FILE.psl:2:3"
-//   },
-//   "call": {
-//     "name": "Your::Type::Method",
-//     "src": "YOUR_FILE.psl:22:5"
-//   }
-// }
+// { "kind": "#...", "type": { "name": "Your::Type", "src": "YOUR_FILE.psl:2:3" } }
 
-interface PSL_Extension<> is
-    /// Semantic utility methods
-    interface Reflection_Util<> is
-        func Get_Decl_Name(D : Decl) -> Univ_String;
-        func Tree_Type(T : Tree) -> optional Type_Descriptor;
-        func Tree_Call(T : Tree) -> optional Decl;
-        func Find_Tree_Source(T : Tree) -> optional Source_Position;
-    end interface Reflection_Util
+/// Store tree sources for later lookup
+interface Source_Store<> is
+    func Lookup_Source(ref S : Source_Store; Pos : Source_Position) -> optional Tree;
+    func Populate(var S : Source_Store);
+    func Create(Source_Filter : Set<Univ_String> := []; Debug : Boolean := #false) -> Source_Store;
+    op "magnitude"(ref S : Source_Store) -> Univ_Integer;
+end interface Source_Store
 
-    /// Store tree sources for later lookup
-    interface Source_Store<> is
-        func Lookup_Source(ref S : Source_Store;
-            Pos : Source_Position) -> optional Tree;
-        func Populate(var S : Source_Store);
-        func Create(Source_Filter : Set<Univ_String> := [];
-            Debug : Boolean := #false) -> Source_Store;
-        op "magnitude"(ref S : Source_Store) -> Univ_Integer;
-        func Query(ref S : Source_Store;
-            Pos : Source_Position) -> Univ_String;
-    end interface Source_Store
+class Source_Store is
+    var Tree_Map : Map<Univ_String, Tree>;
+    var Decl_Map : Map<Univ_String, Decl>;
+    var Source_Filter : Set<Univ_String>;
+    const Debug : Boolean;
 
-    /// Entrypoint
-    func Main(Args : Basic_Array<Univ_String>);
-end interface PSL_Extension
+    func Find_Tree_Source(T : Tree) -> optional Source_Position is
+        if T is null then
+            return null;
+        end if
 
-class PSL_Extension is
-exports
-    class Reflection_Util is
-    exports
-        func Get_Decl_Name(D : Decl) -> Univ_String is
-            if Module_Name(D) is null then
-                return Id(D);
-            end if
-            return Module_Name(D) | "::" | Id(D);
-        end func Get_Decl_Name
+        const Tree_Source := Source_Pos(T);
+        if Tree_Source not null then
+            return Tree_Source;
+        end if
 
-        func Tree_Type(T : Tree) -> optional Type_Descriptor is
-            if T is null then
-                return null;
-            end if
-
-            const T_Type := Resolved_Type(T);
-            if T_Type not null then
-                return T_Type;
-            end if
-
-            const RI := Resolved_Interp(T);
-            if RI not null then
-                const RI_Type := Resolved_Type(RI);
-                if RI_Type not null then
-                    return RI_Type;
+        for I in 1..Num_Operands(T) forward loop
+            const Op := Nth_Operand(T, I);
+            if Op not null then
+                const Op_Source := Find_Tree_Source(Op);
+                if Op_Source not null then
+                    return Op_Source;
                 end if
             end if
-        end func Tree_Type
-
-        func Tree_Call(T : Tree) -> optional Decl is
-            if T is null then
-                return null;
-            end if
-
-            const T_Op := Call_Operation(T);
-            if T_Op not null then
-                return T_Op;
-            end if
-
-            const RI := Resolved_Interp(T);
-            if RI not null then
-                const RI_Operation := Call_Operation(RI);
-                if RI_Operation not null then
-                    return RI_Operation;
-                end if
-            end if
-        end func Tree_Call
-
-        func Find_Tree_Source(T : Tree) -> optional Source_Position is
-            if T is null then
-                return null;
-            end if
-
-            const Tree_Source := Source_Pos(T);
-            if Tree_Source not null then
-                return Tree_Source;
-            end if
-
-            for I in 1..Num_Operands(T) forward loop
-                const Op := Nth_Operand(T, I);
-                if Op not null then
-                    const Op_Source := Find_Tree_Source(Op);
-                    if Op_Source not null then
-                        return Op_Source;
-                    end if
-                end if
-            end loop
-        end func Find_Tree_Source
-    end class Reflection_Util
-
-    class Source_Store is
-        var Tree_Map : Map<Univ_String, Tree>;
-        var Decl_Map : Map<Univ_String, Decl>;
-        var Source_Filter : Set<Univ_String>;
-        const Debug : Boolean;
-
-        /// Checks if position is in source filter
-        func Source_Ok(ref S : Source_Store; Pos : Source_Position) -> Boolean is
-            return File(Pos) in S.Source_Filter;
-        end func Source_Ok
-
-        /// Visit AST tree
-        func Visit_Tree(var S : Source_Store; T : Tree) is
-            if T is null then
-                return;
-            end if
-
-            const Tree_Source := Reflection_Util::Find_Tree_Source(T);
-            const Type_Desc := Reflection_Util::Tree_Type(T);
-            const Tree_Op := Reflection_Util::Tree_Call(T);
-            if Tree_Source not null and then (Type_Desc not null
-                    or else Tree_Op not null) then
-                S.Tree_Map |= (Key => To_String(Tree_Source), Value => T);
-            end if
-
-            for I in 1..Num_Operands(T) forward loop
-                const Op := Nth_Operand(T, I);
-                if Op not null then
-                    Visit_Tree(S, Op);
-                end if
-            end loop
-        end func Visit_Tree
-
-        /// Visit module declaration
-        func Visit_Module(var S : Source_Store; D : Decl {Kind(D) == #module}) is
-            const DR := Decl_Region(D);
-            for I in 1..Num_Items(DR) forward loop
-                Visit_Decl(S, Nth_Item(DR, I));
-            end loop
-        end func Visit_Module
-
-        /// Visit operation declaration
-        func Visit_Op(var S : Source_Store; D : Decl {Kind(D) == #operation}) is
-            const T := Tree_Of(D);
-            Visit_Tree(S, Tree_Of(D));
-
-            const BR := Body_Region(D);
-            if BR not null then
-                for I in 1..Num_Trees(BR) forward loop
-                    Visit_Tree(S, Nth_Tree(BR, I));
-                end loop
-            end if
-        end func Visit_Op
-
-        /// Visit decl
-        func Visit_Decl(var S : Source_Store; D : Decl) is
-            if D is null then
-                return;
-            end if
-
-            const Decl_Source := Decl_Source_Pos(D);
-            if Decl_Source not null then
-                if not Source_Ok(S, Decl_Source) then
-                    return;
-                end if
-                S.Decl_Map |= (Key => To_String(Decl_Source), Value => D);
-            end if
-
-            case Kind(D) of
-                [#module] => Visit_Module(S, D);
-                [#object] => Visit_Tree(S, Tree_Of(D));
-                [#operation] => Visit_Op(S, D);
-                [#type] => null;
-            end case
-        end func Visit_Decl
-    exports
-        op "magnitude"(ref S : Source_Store) -> Univ_Integer is
-            return |S.Tree_Map|;
-        end op "magnitude"
-
-        func Create(Source_Filter : Set<Univ_String>; Debug : Boolean) -> Source_Store is
-            return (Tree_Map => [], Decl_Map => [],
-                Source_Filter => Source_Filter, Debug => Debug);
-        end func Create
-
-        func Lookup_Source(ref S : Source_Store; Pos : Source_Position) -> optional Tree is
-            const P := To_String(Pos);
-            if P in S.Tree_Map then
-                return S.Tree_Map[P];
-            end if
-        end func Lookup_Source
-
-        func Populate(var S : Source_Store) is
-            var Env := Environment::Get_Current_Env();
-            for I in 1..Env.Num_Library_Items() forward loop
-                const Item := Env.Nth_Library_Item(I);
-                Visit_Decl(S, Item);
-            end loop
-
-            if S.Debug then
-                for each [S => V] of S.Tree_Map loop
-                    Println(S | " : " | To_String(Kind(V)))
-                end loop
-            end if
-        end func Populate
-
-        func Query(ref S : Source_Store; Pos : Source_Position) -> Univ_String is
-            const T := Lookup_Source(S, Pos);
-            var Ret_Body : JSON_Value+ := JSON_Object_Value::Create();
-
-            if T is null then
-                Ret_Body["error"] := JSON_String_Value::Create("No tree found at position");
-            else
-                const K := To_String(Kind(T));
-                Ret_Body["kind"] := JSON_String_Value::Create(K);
-
-                // Add type descriptor
-                const Desc := Reflection_Util::Tree_Type(T);
-                if Desc not null then
-                    var Type_Body : JSON_Value+ := JSON_Object_Value::Create();
-                    const Desc_Decl := Type_Decl(Desc);
-                    const Desc_Src := Decl_Source_Pos(Desc_Decl);
-                    Type_Body["name"] := JSON_String_Value::Create(Name(Desc));
-                    Type_Body["src"] := To_String(Desc_Src);
-                    Ret_Body["type"] := Type_Body;
-                end if
-
-                // Add call data
-                const Call := Reflection_Util::Tree_Call(T);
-                if Call not null then
-                    var Call_Body : JSON_Value+ := JSON_Object_Value::Create();
-                    const Call_Src := Decl_Source_Pos(Call);
-                    Call_Body["name"] := Reflection_Util::Get_Decl_Name(Call);
-                    Call_Body["src"] := To_String(Call_Src);
-                    Ret_Body["call"] := Call_Body;
-                end if
-            end if
-
-            return To_String(Ret_Body);
-        end func Query
-    end class Source_Store
-
-    func Main(Args : Basic_Array<Univ_String>) is
-        var Filter : Set<Univ_String> := [];
-        for I in 1..|Args| forward loop
-            Filter |= Args[I];
         end loop
+    end func Find_Tree_Source
 
-        if Count(Filter) == 0 then
-            Println("ERROR: no files specified");
+    /// Checks if position is in source filter
+    func Source_Ok(ref S : Source_Store; Pos : Source_Position) -> Boolean is
+        return File(Pos) in S.Source_Filter;
+    end func Source_Ok
+
+    /// Visit AST tree
+    func Visit_Tree(var S : Source_Store; T : Tree) is
+        if T is null then
             return;
         end if
 
-        var Store := Source_Store::Create(Source_Filter => Filter);
-        Populate(Store);
-    
-        Println(|Store| | " locations loaded. Ready to process queries")
+        const Tree_Source := Find_Tree_Source(T);
+        const Type_Desc := Resolved_Type(T);
+        if Tree_Source not null and then Type_Desc not null then
+            S.Tree_Map |= (Key => To_String(Tree_Source), Value => T);
+        end if
 
-        var Sys_IO := IO::Get_IO();
-        while #true loop
-            const Input := Readln(Sys_IO);
-            if Input not null then
-                var P := Source_Position::From_String(Input);
-                Println(Query(Store, P));
+        for I in 1..Num_Operands(T) forward loop
+            const Op := Nth_Operand(T, I);
+            if Op not null then
+                Visit_Tree(S, Op);
             end if
         end loop
-    end func Main
-end class PSL_Extension
+    end func Visit_Tree
+
+    /// Visit module declaration
+    func Visit_Module(var S : Source_Store; D : Decl {Kind(D) == #module}) is
+        const DR := Decl_Region(D);
+        for I in 1..Num_Items(DR) forward loop
+            Visit_Decl(S, Nth_Item(DR, I));
+        end loop
+    end func Visit_Module
+
+    /// Visit operation declaration
+    func Visit_Op(var S : Source_Store; D : Decl {Kind(D) == #operation}) is
+        const T := Tree_Of(D);
+        Visit_Tree(S, Tree_Of(D));
+
+        const BR := Body_Region(D);
+        if BR not null then
+            for I in 1..Num_Trees(BR) forward loop
+                Visit_Tree(S, Nth_Tree(BR, I));
+            end loop
+        end if
+    end func Visit_Op
+
+    /// Visit decl
+    func Visit_Decl(var S : Source_Store; D : Decl) is
+        if D is null then
+            return;
+        end if
+
+        const Decl_Source := Decl_Source_Pos(D);
+        if Decl_Source not null then
+            if not Source_Ok(S, Decl_Source) then
+                return;
+            end if
+            S.Decl_Map |= (Key => To_String(Decl_Source), Value => D);
+        end if
+
+        case Kind(D) of
+            [#module] => Visit_Module(S, D);
+            [#object] => Visit_Tree(S, Tree_Of(D));
+            [#operation] => Visit_Op(S, D);
+            [#type] => null;
+        end case
+    end func Visit_Decl
+exports
+    op "magnitude"(ref S : Source_Store) -> Univ_Integer is
+        return |S.Tree_Map|;
+    end op "magnitude"
+
+    func Create(Source_Filter : Set<Univ_String>; Debug : Boolean) -> Source_Store is
+        return (Tree_Map => [], Decl_Map => [], Source_Filter => Source_Filter, Debug => Debug);
+    end func Create
+
+    func Lookup_Source(ref S : Source_Store; Pos : Source_Position) -> optional Tree is
+        const P := To_String(Pos);
+        if P in S.Tree_Map then
+            return S.Tree_Map[P];
+        else
+            return null;
+        end if
+    end func Lookup_Source
+
+    func Populate(var S : Source_Store) is
+        var Env := Environment::Get_Current_Env();
+        for I in 1..Env.Num_Library_Items() forward loop
+            const Item := Env.Nth_Library_Item(I);
+            Visit_Decl(S, Item);
+        end loop
+        if S.Debug then
+            for each [S => V] of S.Tree_Map loop
+                Println(S | " : " | To_String(Kind(V)))
+            end loop
+        end if
+    end func Populate
+end class Source_Store
+
+/// Creates JSON response for user query
+func Formulate_Response(Pos : Source_Position; ref S : Source_Store) -> Univ_String is
+    const T := Lookup_Source(S, Pos);
+    var Ret_Body : JSON_Value+ := JSON_Object_Value::Create();
+
+    if T is null then
+        Ret_Body["error"] := JSON_String_Value::Create("No tree found at position");
+    else 
+        const Desc := Resolved_Type(T);
+        const K := To_String(Kind(T));
+        Ret_Body["kind"] := JSON_String_Value::Create(K);
+        if Desc not null then
+            var Type_Body : JSON_Value+ := JSON_Object_Value::Create();
+            const Desc_Decl := Type_Decl(Desc);
+            const Desc_Src := Decl_Source_Pos(Desc_Decl);
+            Type_Body["name"] := JSON_String_Value::Create(Name(Desc));
+            Type_Body["src"] := To_String(Desc_Src);
+            Ret_Body["type"] := Type_Body;
+        end if
+    end if
+
+    return To_String(Ret_Body);
+end func Formulate_Response
+
+func PSL_Extension_Main(Args : Basic_Array<Univ_String>) is
+    var Filter : Set<Univ_String> := [];
+    for I in 1..|Args| forward loop
+        Filter |= Args[I];
+    end loop
+
+    if Count(Filter) == 0 then
+        Println("ERROR: no files specified");
+        return;
+    end if
+
+    var Store := Source_Store::Create(Source_Filter => Filter, Debug => #true);
+    Populate(Store);
+ 
+    Println(|Store| | " locations loaded. Ready to process queries")
+
+    var Sys_IO := IO::Get_IO();
+    while #true loop
+        const Input := Readln(Sys_IO);
+        if Input not null then
+            var P := Source_Position::From_String(Input);
+            Println(Formulate_Response(P, Store));
+        end if
+    end loop
+end func PSL_Extension_Main

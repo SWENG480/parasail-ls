@@ -1,5 +1,5 @@
 // src/fallbackTokenizer.ts
-import { connection } from './lspLifecycle'; 
+import { connection } from './lspLifeCycle'; 
 // (We import `connection` directly so we can do connection.console.log(...) below.)
 
 import { Position } from 'vscode-languageserver/node';
