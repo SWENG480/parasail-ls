@@ -1,0 +1,3 @@
+[submodule "syntaxes/parasail-tm"]
+	path = syntaxes/parasail-tm
+	url = https://github.com/parasail-lang/parasail-tm.git
